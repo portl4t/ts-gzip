@@ -36,6 +36,7 @@ ts_gzip_info_create(int type, int flags)
     zinfo->src_len = 0;
     zinfo->flags = flags;
     zinfo->crc = crc32(0, Z_NULL, 0);
+    zinfo->writed = 0;
 
     return zinfo;
 }
@@ -202,7 +203,7 @@ ts_gzip_inflate(ts_gzip_info *zinfo, TSIOBufferReader readerp, TSIOBuffer bufp, 
     if (avail <= TS_GZIP_CRC_LENGTH)
         return 0;
 
-    ravail = avail - TS_GZIP_CRC_LENGTH;
+    ravail = avail - TS_GZIP_CRC_LENGTH;        // real use
 
     write_blk = TSIOBufferStart(bufp);
     flush = 0;
@@ -220,7 +221,6 @@ ts_gzip_inflate(ts_gzip_info *zinfo, TSIOBufferReader readerp, TSIOBuffer bufp, 
                 zinfo->z_strm.avail_in = bytes;
                 already += bytes;
             }
-
 
         } else if (end) {
             flush = Z_FINISH;
@@ -400,7 +400,7 @@ ts_gzip_transform_handler(TSCont contp, ts_gzip_transform_ctx *tc)
     TSVConn             output_conn;
     TSVIO               input_vio;
     TSIOBufferReader    input_reader;
-    int64_t             towrite, upstream_done, avail;
+    int64_t             towrite, upstream_done, avail, left, writen;
     int                 ret, eos;
 
     output_conn = TSTransformOutputVConnGet(contp);
@@ -432,30 +432,47 @@ ts_gzip_transform_handler(TSCont contp, ts_gzip_transform_ctx *tc)
         eos = 1;
     }
 
-    if (tc->zinfo->type == TS_GZIP_TYPE_COMPRESS) {
-        ret = ts_gzip_deflate(tc->zinfo, input_reader, tc->output_buffer, eos);
+    if (tc->zinfo->state == TS_GZIP_STATE_OK) {
+
+        if (tc->zinfo->type == TS_GZIP_TYPE_COMPRESS) {
+            ret = ts_gzip_deflate(tc->zinfo, input_reader, tc->output_buffer, eos);
+
+        } else {
+            ret = ts_gzip_inflate(tc->zinfo, input_reader, tc->output_buffer, eos);
+        }
 
     } else {
-        ret = ts_gzip_inflate(tc->zinfo, input_reader, tc->output_buffer, eos);
+        TSIOBufferReaderConsume(input_reader, towrite);
+        ret = 0;
     }
 
-    if (ret < 0) {
+    left = TSIOBufferReaderAvail(input_reader);
+    writen = towrite - left;
+
+    if (ret < 0 || eos) {
+        TSVIONDoneSet(input_vio, upstream_done + writen);
         tc->total = TSVIONDoneGet(tc->output_vio) + TSIOBufferReaderAvail(tc->output_reader);
         TSVIONBytesSet(tc->output_vio, tc->total);
         TSVIOReenable(tc->output_vio);
-        TSContCall(TSVIOContGet(input_vio), TS_EVENT_ERROR, input_vio);
-        return ret;
+
+        if (ret < 0) {
+            TSContCall(TSVIOContGet(input_vio), TS_EVENT_ERROR, input_vio);
+
+        } else {
+            TSContCall(TSVIOContGet(input_vio), TS_EVENT_VCONN_WRITE_COMPLETE, input_vio);
+        }
+
+        return 1;
     }
 
-    if (!eos) {
+    // unfinished
+
+    if (TSIOBufferReaderAvail(tc->output_reader) > 0)
         TSVIOReenable(tc->output_vio);
+
+    if (writen > 0) {
+        TSVIONDoneSet(input_vio, upstream_done + writen);
         TSContCall(TSVIOContGet(input_vio), TS_EVENT_VCONN_WRITE_READY, input_vio);
-
-    } else {
-        tc->total = TSVIONDoneGet(tc->output_vio) + TSIOBufferReaderAvail(tc->output_reader);
-        TSVIONBytesSet(tc->output_vio, tc->total);
-        TSVIOReenable(tc->output_vio);
-        TSContCall(TSVIOContGet(input_vio), TS_EVENT_VCONN_WRITE_COMPLETE, input_vio);
     }
 
     return 1;
