@@ -26,9 +26,13 @@ ts_gzip_info_create(int type, int flags)
 
     if (type == TS_GZIP_TYPE_COMPRESS) {
         deflateInit2(&zinfo->z_strm, TS_GZIP_COMPRESSION_LEVEL, Z_DEFLATED, -MAX_WBITS, TS_GZIP_ZLIB_MEM_LEVEL, Z_DEFAULT_STRATEGY);
+        zinfo->reserved_buffer = NULL;
+        zinfo->reserved_reader = NULL;
 
     } else {
         inflateInit2(&zinfo->z_strm, -MAX_WBITS);
+        zinfo->reserved_buffer = TSIOBufferCreate();
+        zinfo->reserved_reader = TSIOBufferReaderAlloc(zinfo->reserved_buffer);
     }
 
     zinfo->type = type;
@@ -56,6 +60,12 @@ ts_gzip_info_destroy(ts_gzip_info *zinfo)
             inflateEnd(&zinfo->z_strm);
         }
     }
+
+    if (zinfo->reserved_reader)
+        TSIOBufferReaderFree(zinfo->reserved_reader);
+
+    if (zinfo->reserved_buffer)
+        TSIOBufferDestroy(zinfo->reserved_buffer);
 
     TSfree(zinfo);
 }
@@ -173,23 +183,30 @@ ts_gzip_deflate(ts_gzip_info *zinfo, TSIOBufferReader readerp, TSIOBuffer bufp, 
 }
 
 int
-ts_gzip_inflate(ts_gzip_info *zinfo, TSIOBufferReader readerp, TSIOBuffer bufp, int end)
+ts_gzip_inflate(ts_gzip_info *zinfo, TSIOBufferReader ireader, TSIOBuffer bufp, int end)
 {
-    int64_t             bytes, avail, wavail, ravail, already, left, need;
+    int64_t             bytes, avail, wavail, ravail, already, left, need, incoming;
     const char          *start;
     int                 tail[2];
     int                 wlen, flush, res;
     TSIOBufferBlock     blk, write_blk;
+    TSIOBufferReader    readerp;
 
     if (zinfo->state == TS_GZIP_STATE_DONE || zinfo->state == TS_GZIP_STATE_ERROR) {
         return -1;
     }
 
+    incoming = TSIOBufferReaderAvail(ireader);
+
+    TSIOBufferCopy(zinfo->reserved_buffer, ireader, incoming, 0);
+    TSIOBufferReaderConsume(ireader, incoming);
+
+    readerp = zinfo->reserved_reader;
     avail = TSIOBufferReaderAvail(readerp);
 
     if (!zinfo->writed) {
 
-        if (avail < sizeof(gzheader))
+        if (avail < (int64_t)sizeof(gzheader))
             return 0;
 
         zinfo->writed = 1;
@@ -303,7 +320,7 @@ ts_gzip_inflate(ts_gzip_info *zinfo, TSIOBufferReader readerp, TSIOBuffer bufp, 
         } while (blk);
 
         TSIOBufferReaderConsume(readerp, left);
-        if (tail[0] != zinfo->crc || tail[1] != zinfo->src_len)
+        if (tail[0] != (int)zinfo->crc || tail[1] != (int)zinfo->src_len)
             return -1;
     }
 

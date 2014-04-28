@@ -29,6 +29,9 @@ typedef enum {
 } ts_gzip_type;
 
 typedef struct {
+    TSIOBuffer          reserved_buffer;
+    TSIOBufferReader    reserved_reader;
+
     z_stream    z_strm;
     uint32_t    src_len;
     uint32_t    crc;
